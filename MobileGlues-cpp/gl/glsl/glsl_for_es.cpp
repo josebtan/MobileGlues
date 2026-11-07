@@ -239,6 +239,172 @@ void trim(std::string& str) {
     str.erase(std::find_if(str.rbegin(), str.rend(), [](int ch) { return !std::isspace(ch); }).base(), str.end());
 }
 
+// Fragment output arrays that are indexed with a non-constant expression are rejected by ESSL 3.00/3.10
+// compilers (and by several 3.20 drivers, e.g. Mali: "Outputs declared as arrays may only be indexed by a
+// constant integral expression"). Minecraft 26.3's order-independent-transparency shaders do exactly that
+// (`coeff[attachmentIndex][i] = ...` inside a loop).
+//
+// Each such array
+//     layout(location = L) out highp vec4 coeff[N];
+// is replaced by N separate outputs (locations L .. L+N-1) plus a plain global array that every access is
+// redirected to; the array is copied into the outputs when main() finishes. Arrays that are only ever
+// indexed by integer literals are left alone.
+static bool is_ident_char(char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+}
+
+// Returns the position just past the ']' that closes the '[' at `open`, or npos.
+static size_t match_bracket(const std::string& s, size_t open) {
+    int depth = 0;
+    for (size_t i = open; i < s.size(); ++i) {
+        if (s[i] == '[') ++depth;
+        else if (s[i] == ']' && --depth == 0) return i + 1;
+    }
+    return std::string::npos;
+}
+
+// Returns the position just past the '}' that closes the '{' at `open`, or npos.
+static size_t match_brace(const std::string& s, size_t open) {
+    int depth = 0;
+    for (size_t i = open; i < s.size(); ++i) {
+        if (s[i] == '{') ++depth;
+        else if (s[i] == '}' && --depth == 0) return i + 1;
+    }
+    return std::string::npos;
+}
+
+static bool is_integer_literal(std::string expr) {
+    trim(expr);
+    if (expr.empty()) return false;
+    size_t i = 0;
+    while (i < expr.size() && std::isdigit(static_cast<unsigned char>(expr[i]))) ++i;
+    if (i < expr.size() && (expr[i] == 'u' || expr[i] == 'U')) ++i;
+    return i == expr.size();
+}
+
+std::string flattenDynamicOutputArrays(const std::string& essl) {
+    static const std::regex declRegex(
+        R"(layout\s*\(([^)]*)\)\s*out\s+((?:highp\s+|mediump\s+|lowp\s+)?)(\w+)\s+(\w+)\s*\[\s*(\d+)\s*\]\s*;)");
+    static const std::regex locRegex(R"(location\s*=\s*(\d+))");
+
+    std::string result = essl;
+    bool changed = false;
+
+    for (size_t searchFrom = 0; searchFrom < result.size();) {
+        std::smatch m;
+        auto begin = result.cbegin() + searchFrom;
+        if (!std::regex_search(begin, result.cend(), m, declRegex)) break;
+
+        const size_t declPos = searchFrom + static_cast<size_t>(m.position(0));
+        const size_t declLen = static_cast<size_t>(m.length(0));
+        const std::string layoutArgs = m[1].str();
+        std::string precision = m[2].str();
+        trim(precision);
+        const std::string type = m[3].str();
+        const std::string name = m[4].str();
+        const int count = std::atoi(m[5].str().c_str());
+
+        std::smatch lm;
+        if (count <= 0 || count > 16 || !std::regex_search(layoutArgs, lm, locRegex)) {
+            searchFrom = declPos + declLen;
+            continue;
+        }
+        const int baseLocation = std::atoi(lm[1].str().c_str());
+
+        // Is any access to the array non-constant?
+        bool dynamic = false;
+        for (size_t pos = 0; (pos = result.find(name, pos)) != std::string::npos; pos += name.size()) {
+            if (pos >= declPos && pos < declPos + declLen) continue;
+            if (pos > 0 && is_ident_char(result[pos - 1])) continue;
+            size_t after = pos + name.size();
+            if (after < result.size() && is_ident_char(result[after])) continue;
+            while (after < result.size() && std::isspace(static_cast<unsigned char>(result[after]))) ++after;
+            if (after >= result.size() || result[after] != '[') continue;
+            const size_t close = match_bracket(result, after);
+            if (close == std::string::npos) continue;
+            if (!is_integer_literal(result.substr(after + 1, close - after - 2))) {
+                dynamic = true;
+                break;
+            }
+        }
+        if (!dynamic) {
+            searchFrom = declPos + declLen;
+            continue;
+        }
+
+        const std::string arrName = name + "_mg_arr";
+        const std::string prefix = precision.empty() ? "" : precision + " ";
+
+        // 1. Redirect every access to the plain array (declaration excluded, it is rewritten below).
+        std::string rewritten;
+        rewritten.reserve(result.size() + 64);
+        size_t last = 0;
+        for (size_t pos = 0; (pos = result.find(name, pos)) != std::string::npos; pos += name.size()) {
+            if (pos >= declPos && pos < declPos + declLen) continue;
+            if (pos > 0 && is_ident_char(result[pos - 1])) continue;
+            size_t after = pos + name.size();
+            if (after < result.size() && is_ident_char(result[after])) continue;
+            size_t b = after;
+            while (b < result.size() && std::isspace(static_cast<unsigned char>(result[b]))) ++b;
+            if (b >= result.size() || result[b] != '[') continue;
+            rewritten.append(result, last, pos - last);
+            rewritten.append(arrName);
+            last = after;
+        }
+        rewritten.append(result, last, std::string::npos);
+        result.swap(rewritten);
+
+        // 2. Replace the declaration (its position did not move: only text after it can have changed by
+        //    renaming, and renaming never happens inside the declaration).
+        std::string newDecl;
+        for (int k = 0; k < count; ++k) {
+            newDecl += "layout(location = " + std::to_string(baseLocation + k) + ") out " + prefix + type + " " +
+                       name + "_mg_o" + std::to_string(k) + ";\n";
+        }
+        newDecl += prefix + type + " " + arrName + "[" + std::to_string(count) + "];";
+        // Accesses before the declaration would have shifted `declPos`; outputs are always declared at
+        // global scope before use, so this cannot happen for valid shaders.
+        result.replace(declPos, declLen, newDecl);
+
+        // 3. Copy into the outputs when main() ends.
+        std::string copies;
+        for (int k = 0; k < count; ++k) {
+            copies += name + "_mg_o" + std::to_string(k) + " = " + arrName + "[" + std::to_string(k) + "];\n";
+        }
+        static const std::regex mainRegex(R"(void\s+main\s*\(\s*(?:void)?\s*\)\s*\{)");
+        std::smatch mm;
+        auto mbegin = result.cbegin() + declPos + newDecl.size();
+        if (std::regex_search(mbegin, result.cend(), mm, mainRegex)) {
+            const size_t mainOpen = declPos + newDecl.size() + static_cast<size_t>(mm.position(0)) +
+                                    static_cast<size_t>(mm.length(0)) - 1;
+            const size_t mainEnd = match_brace(result, mainOpen); // just past the closing brace
+            if (mainEnd != std::string::npos) {
+                std::string body = result.substr(mainOpen + 1, mainEnd - mainOpen - 2);
+                // Early `return;` statements inside main must flush the outputs too.
+                std::string newBody;
+                size_t bl = 0;
+                for (size_t pos = 0; (pos = body.find("return", pos)) != std::string::npos; pos += 6) {
+                    if (pos > 0 && is_ident_char(body[pos - 1])) continue;
+                    size_t after = pos + 6;
+                    while (after < body.size() && std::isspace(static_cast<unsigned char>(body[after]))) ++after;
+                    if (after >= body.size() || body[after] != ';') continue;
+                    newBody.append(body, bl, pos - bl);
+                    newBody += "{\n" + copies + "return;\n}";
+                    bl = after + 1;
+                }
+                newBody.append(body, bl, std::string::npos);
+                newBody += "\n" + copies;
+                result.replace(mainOpen + 1, mainEnd - mainOpen - 2, newBody);
+            }
+        }
+
+        changed = true;
+        searchFrom = declPos + newDecl.size();
+    }
+
+    return changed ? result : essl;
+}
+
 std::string processOutColorLocations(const std::string& glslCode) {
     const static std::regex pattern(R"(\n(out highp vec4 outColor)(\d+);)");
     const std::string replacement = "\nlayout(location=$2) $1$2;";
@@ -771,6 +937,9 @@ std::string GLSLtoGLSLES_2(const char* glsl_code, GLenum glsl_type, uint essl_ve
         essl = removeLayoutBinding(essl);
     }
     essl = processOutColorLocations(essl);
+    if (glsl_type == GL_FRAGMENT_SHADER) {
+        essl = flattenDynamicOutputArrays(essl);
+    }
     essl = forceSupporterOutput(essl);
 
     LOG_D("Originally GLSL to GLSL ES Complete: \n%s", essl.c_str())
