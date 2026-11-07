@@ -1,5 +1,7 @@
 name: Build Android libmobileglues
 on: [push, workflow_dispatch]
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -22,3 +24,10 @@ jobs:
         with:
           name: libmobileglues-arm64-v8a
           path: build/libmobileglues.so
+      - name: Publish .so to branch built
+        run: |
+          mkdir /tmp/out && cp build/libmobileglues.so /tmp/out/
+          git config user.name github-actions && git config user.email actions@github.com
+          git checkout --orphan built && git rm -rf -q . && cp /tmp/out/libmobileglues.so .
+          git add libmobileglues.so && git commit -q -m "build ${GITHUB_SHA}"
+          git push -f origin built
